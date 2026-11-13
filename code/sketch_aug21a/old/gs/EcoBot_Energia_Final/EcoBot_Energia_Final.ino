@@ -1,9 +1,8 @@
-#define ECO_TESTE_SEM_LDR 1  // 1 = simulacao; 0 = leitura real do sensor LDR
-
 #include <DabbleESP32.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Preferences.h> // Guarda calibracao do LDR entre reinicializacoes
  
 #define IN1 13
 #define IN2 4
@@ -15,6 +14,7 @@
  
 #define TRIG_FRONT 25
 #define ECHO_FRONT 26
+#define PINO_LDR 34   // Sinal AO do modulo LDR; GPIO34 e entrada analogica
  
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -30,10 +30,64 @@ const unsigned long TEMPO_SONO_MS = 8000;  // fica parado sem comando por isso -
 const unsigned long MONITOR_INTERVALO_MS = 250;  // periodo do monitor de proximidade
  
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+bool displayOk = false;
 
-// EcoBot: declaracoes das duas funcoes novas (implementadas NO FINAL do arquivo).
+// ================= ECOBOT: CONFIGURACAO =================
+// 0 = sensor LDR real; 1 = simular a luz pelo Monitor Serial (a/b).
+#define ECO_MODO_SIMULACAO 0
+// 0 = alerta em 5 minutos; 1 = alerta em 10 segundos (somente demonstracao).
+#define ECO_DEMO_RAPIDA 0
+
+const unsigned long ECO_TEMPO_ALERTA_MS = ECO_DEMO_RAPIDA ? 10000UL : 300000UL;
+const unsigned long ECO_INTERVALO_LEITURA_MS = 250UL;
+const unsigned long ECO_TEMPO_ESTAVEL_MS = 2000UL;
+const unsigned long ECO_INTERVALO_BIP_MS = 5000UL;
+const unsigned long ECO_DURACAO_BIP_MS = 180UL;
+const int ECO_LUZ_LIGADA_PCT = 55;
+const int ECO_LUZ_DESLIGADA_PCT = 45;
+
+Preferences ecoPrefs;
+int ecoRawEscuro = -1;
+int ecoRawClaro = -1;
+int ecoLeitura = 0;
+int ecoPercentual = 0;
+int ecoSimulacaoADC = 600;
+bool ecoLuzCandidata = false;
+bool ecoLuzConfirmada = false;
+bool ecoAlertaAtivo = false;
+bool ecoBipAtivo = false;
+bool ecoTelaAtiva = false;
+unsigned long ecoMudancaCandidataMs = 0;
+unsigned long ecoInicioLuzMs = 0;
+unsigned long ecoUltimaLeituraMs = 0;
+unsigned long ecoUltimoRelatorioMs = 0;
+unsigned long ecoUltimoBipMs = 0;
+unsigned long ecoInicioBipMs = 0;
+unsigned long ecoUltimaTelaMs = 0;
+int ecoClasseIA = 0; // 0=normal, 1=atencao, 2=revisar
+
+// Exemplos DIDATICOS rotulados para k-NN: luz (%) e tempo (0-100 = 0-10 min).
+// Nao sao leituras coletadas de residencias reais.
+struct EcoAmostra { uint8_t luz; uint8_t tempo; uint8_t classe; };
+const EcoAmostra ECO_TREINO[] = {
+  {20,0,0}, {40,30,0}, {35,80,0}, {90,0,0}, {75,20,0},
+  {65,40,1}, {85,40,1}, {55,30,1}, {60,50,1}, {90,50,1}, {48,55,1},
+  {60,60,2}, {80,60,2}, {95,60,2}, {60,90,2}, {85,90,2},
+  {95,100,2}, {35,100,0}
+};
+const int ECO_N_TREINO = sizeof(ECO_TREINO)/sizeof(ECO_TREINO[0]);
+
+// Declaracoes das novas funcoes; mantemos o restante do codigo original.
 void ecoIniciar();
-void ecoAtualizar();
+void ecoLerSerial();
+void ecoMonitorar();
+void ecoAlertaSonoro(bool outroSomAtivo);
+void ecoAtualizarOLED();
+void ecoImprimirEstado();
+void ecoAjuda();
+bool ecoCalibrado();
+int ecoClassificarKNN(int claridadePct, unsigned long tempoMs);
+
  
 enum Face {
   FACE_IDLE, FACE_FORWARD, FACE_BACKWARD, FACE_LEFT, FACE_RIGHT,
@@ -148,7 +202,8 @@ void setup() {
   ledcAttach(ENB, PWM_FREQ, PWM_RES);
   logMsg("BOOT", "PWM configurado (ENA/ENB)");
  
-  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+  displayOk = display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
+  if (!displayOk) {
     logMsg("ERRO", "Falha ao encontrar o display OLED");
   } else {
     logMsg("BOOT", "Display OLED OK");
@@ -157,13 +212,15 @@ void setup() {
   Dabble.begin("My Bluetooth Car");
   logMsg("BT", "Dabble iniciado: 'My Bluetooth Car' (aguardando conexao)");
   stopMotors();
+  ecoIniciar(); // NOVO: LDR, calibracao, temporizador e IA
   ultimaAcaoMs = millis();
-  ecoIniciar();  // NOVO: inicializa o sensor de luminosidade.
   logMsg("BOOT", "Setup concluido");
 }
  
 void loop() {
   Dabble.processInput();
+  ecoMonitorar();    // NOVO: conta iluminacao por 5 minutos sem delay()
+  ecoLerSerial();    // NOVO: comandos de calibracao e teste
  
   bool triangle = GamePad.isTrianglePressed();
   if (triangle && !lastTriangleState) {
@@ -210,8 +267,8 @@ void loop() {
     tocarSirene();
     currentFace = FACE_SCARED;
     ultimaAcaoMs = millis();
-  } else {
-    noTone(BUZZER);
+  } else if (!ecoBipAtivo) {
+    noTone(BUZZER);  // Nao corta o bip de alerta do EcoBot
   }
  
   // ---- Modo soninho: sem nenhum comando por um tempo ----
@@ -220,12 +277,13 @@ void loop() {
     logMsg("ESTADO", "Sem comandos ha tempo demais -> modo soninho");
   }
  
-  if (currentFace != lastDrawnFace) {
+  if (currentFace != lastDrawnFace && !ecoTelaAtiva) {
     desenharFace(currentFace);
     lastDrawnFace = currentFace;
   }
 
-  ecoAtualizar();  // NOVO: analisa o LDR e roda a IA sem bloquear o carrinho.
+  ecoAlertaSonoro(square || circle || cross || start);
+  ecoAtualizarOLED();  // Mostra resumo por alguns segundos e devolve as carinhas
 }
  
 // ================= Modo manual =================
@@ -254,7 +312,12 @@ void rodarPilotoAutomatico() {
     imprimirProximidade("auto", distFrente, -1, false);
   }
  
-  if (distFrente < 0 || distFrente > DIST_LIMIT_CM) {
+  if (distFrente < 0) {
+    stopMotors(); // Seguranca: sem leitura confiavel, nao avanca as cegas
+    currentFace = FACE_SCARED;
+    return;
+  }
+  if (distFrente > DIST_LIMIT_CM) {
     moveForward();
     currentFace = FACE_FORWARD;
     ultimaAcaoMs = millis();
@@ -380,6 +443,7 @@ void tocarSirene() {
 // ================= Faces =================
  
 void desenharFace(Face f) {
+  if (!displayOk) return;
   logTs("DISPLAY");
   Serial.print("Face -> ");
   Serial.println(nomeFace(f));
@@ -485,290 +549,283 @@ void faceDormindo() {
   display.print("z");
   display.setCursor(108, 0);
   display.print("Z");
+} 
+
+// ====================================================================
+// ECOBOT - ASSISTENTE DE USO CONSCIENTE DE ENERGIA RESIDENCIAL
+// Este LDR percebe CLARIDADE. Ele NAO distingue sol de lampada acesa.
+// O aviso de 5 min pede para VERIFICAR a iluminacao, nao afirma consumo.
+// ====================================================================
+
+bool ecoCalibrado() {
+  return ecoRawEscuro >= 0 && ecoRawClaro >= 0 &&
+         abs(ecoRawClaro - ecoRawEscuro) >= 200;
 }
-
-
-// ============================================================================
-// ECOBOT | ASSISTENTE DE USO CONSCIENTE DE ENERGIA RESIDENCIAL
-// ============================================================================
-// MODIFICACOES MINIMAS NO CODIGO ORIGINAL:
-// 1) Dois prototipos declarados depois da criacao do display.
-// 2) ecoIniciar() chamado no setup().
-// 3) ecoAtualizar() chamado no final do loop().
-// TODO O RESTANTE DO CODIGO ACIMA E O PROJETO ORIGINAL.
-//
-// HARDWARE NOVO: 1 modulo LDR com pino AO (analogico).
-//   LDR VCC -> ESP32 3V3
-//   LDR GND -> ESP32 GND
-//   LDR AO  -> ESP32 GPIO 34
-//   LDR DO  -> NAO CONECTAR
-// NUNCA ligue o modulo em 5 V: a entrada do ESP32 nao e tolerante a 5 V.
-//
-// COMO TESTAR (Monitor Serial 115200, fim de linha pode ser qualquer um):
-//   e   = memoriza a leitura com o sensor coberto/escuro
-//   c   = memoriza a leitura com o sensor iluminado/claro
-//   1   = informa que uma lampada residencial ESTA LIGADA (simulacao)
-//   0   = informa que a lampada ESTA DESLIGADA (simulacao)
-//   ?   = mostra a ajuda
-// No modo real, o LDR e real. No modo teste, as leituras sao simuladas.
-// O estado da lampada e informado por comando,
-// porque este carrinho NAO tem sensor de corrente, rele, LED ou tomada.
-//
-// IA REAL, MAS SIMPLES: classificador k-NN (k=3) com exemplos rotulados.
-// As amostras de treinamento sao cenarios DIDATICOS, nao medicoes reais.
-// O sistema oferece RECOMENDACOES; ele nao mede kWh nem controla a rede.
-// ============================================================================
-
-const uint8_t ECO_PIN_LDR = 34;
-bool ecoSimularClaro = false;  // false = 600 ADC, true = 3300 ADC (somente em simulacao)
-const unsigned long ECO_INTERVALO_MS = 2000;
-const unsigned long ECO_INTERVALO_TELA_MS = 4000;
-const uint8_t ECO_K = 3;
-
-// Calibracao local, refeita a cada reinicio para dispensar EEPROM/bibliotecas.
-int ecoLeituraEscuro = -1;
-int ecoLeituraClaro = -1;
-int ecoLeituraAtual = 0;
-float ecoClaridadePercentual = 0.0f;
-bool ecoLampadaLigada = false;
-bool ecoLampadaInformada = false;
-bool ecoAlertaDesperdicio = false;
-unsigned long ecoUltimaAnaliseMs = 0;
-unsigned long ecoUltimaTelaMs = 0;
-
-struct EcoExemplo {
-  uint8_t claridade;    // 0 = escuro, 100 = muito claro
-  bool lampadaLigada;   // estado da lampada INFORMADO pelo usuario
-  bool desperdicio;     // rotulo usado na classificacao
-};
-
-// Base de treinamento DEMONSTRATIVA: pode ser ampliada com dados coletados.
-const EcoExemplo ECO_EXEMPLOS[] = {
-  {  0, false, false}, { 25, false, false}, { 50, false, false},
-  { 75, false, false}, {100, false, false},
-  {  0, true,  false}, { 10, true,  false}, { 20, true,  false},
-  { 30, true,  false}, { 40, true,  false}, { 50, true,  false},
-  { 60, true,   true}, { 70, true,   true}, { 80, true,   true},
-  { 90, true,   true}, {100, true,   true}
-};
-const size_t ECO_TOTAL_EXEMPLOS = sizeof(ECO_EXEMPLOS) / sizeof(ECO_EXEMPLOS[0]);
 
 void ecoAjuda() {
-  Serial.println();
-  Serial.println("========== ECOBOT - COMANDOS ==========");
-#if ECO_TESTE_SEM_LDR
-  Serial.println("MODO TESTE: sem sensor fisico conectado");
-  Serial.println("e = calibrar ESCURO SIMULADO (600 ADC)");
-  Serial.println("c = calibrar CLARO SIMULADO (3300 ADC)");
-  Serial.println("a = simular ambiente CLARO");
-  Serial.println("b = simular ambiente ESCURO");
-#else
-  Serial.println("e = calibrar no ESCURO (cubra o LDR)");
-  Serial.println("c = calibrar no CLARO  (ilumine o LDR)");
+  Serial.println("\n[ECO] COMANDOS DO MONITOR SERIAL (115200, enviar cada letra):");
+  Serial.println("  e = calibrar ESCURO (cobrir sensor)");
+  Serial.println("  c = calibrar CLARO (iluminar sensor)");
+  Serial.println("  s = mostrar estado atual");
+  Serial.println("  r = reiniciar contagem dos 5 minutos");
+  Serial.println("  ? = ajuda");
+#if ECO_MODO_SIMULACAO
+  Serial.println("  a = simular claridade; b = simular escuro");
 #endif
-  Serial.println("1 = informar LAMPADA LIGADA (simulada)");
-  Serial.println("0 = informar LAMPADA DESLIGADA (simulada)");
-  Serial.println("? = mostrar esta ajuda");
-  Serial.println("IA = k-NN, 3 vizinhos, com exemplos didaticos");
-  Serial.println("=======================================");
-  Serial.println();
+  Serial.println("[ECO] OBS: o LDR mede luz ambiente, nao consumo de energia.\n");
 }
 
-int ecoLerLDR() {
-#if ECO_TESTE_SEM_LDR
-  // Simula sensor calibravel em 0-100%, sem pino externo conectado.
-  return ecoSimularClaro ? 3300 : 600;
+void ecoIniciar() {
+  analogReadResolution(12); // leitura 0..4095
+  pinMode(PINO_LDR, INPUT);
+#if ECO_MODO_SIMULACAO
+  ecoRawEscuro = 600;
+  ecoRawClaro = 3300;
+  ecoSimulacaoADC = 600;
+  Serial.println("[ECO] SIMULACAO ATIVA: a=claro, b=escuro");
 #else
-  long soma = 0;
-  for (int i = 0; i < 8; i++) {
-    soma += analogRead(ECO_PIN_LDR);
-    delayMicroseconds(150);
+  ecoPrefs.begin("ecobot-ldr", false);
+  ecoRawEscuro = ecoPrefs.getInt("escuro", -1);
+  ecoRawClaro = ecoPrefs.getInt("claro", -1);
+  if (!ecoCalibrado()) {
+    Serial.println("[ECO] PRIMEIRO USO: calibrar com e (escuro) e c (claro).");
+  } else {
+    Serial.println("[ECO] Calibracao recuperada da memoria ESP32.");
   }
-  return (int)(soma / 8);
 #endif
+  ecoUltimoBipMs = millis();
+  ecoAjuda();
 }
 
-bool ecoEstaCalibrado() {
-  // O sinal pode subir ou descer quando se ilumina o LDR: a calibracao
-  // funciona nos dois sentidos e independe do tipo de modulo analogico.
-  return ecoLeituraEscuro >= 0 && ecoLeituraClaro >= 0 &&
-         abs(ecoLeituraClaro - ecoLeituraEscuro) >= 80;
+void ecoReiniciarContagem() {
+  ecoLuzCandidata = false;
+  ecoLuzConfirmada = false;
+  ecoAlertaAtivo = false;
+  ecoMudancaCandidataMs = millis();
+  ecoInicioLuzMs = 0;
+  ecoClasseIA = 0;
+  if (ecoBipAtivo) {
+    noTone(BUZZER);
+    ecoBipAtivo = false;
+  }
 }
 
-float ecoConverterParaPercentual(int leitura) {
-  float faixa = (float)(ecoLeituraClaro - ecoLeituraEscuro);
-  float percentual = 100.0f * (leitura - ecoLeituraEscuro) / faixa;
-  if (percentual < 0.0f) percentual = 0.0f;
-  if (percentual > 100.0f) percentual = 100.0f;
-  return percentual;
-}
-
-// Classificador k-NN: encontra os 3 cenarios rotulados mais proximos.
-// A penalidade grande (200) impede que "lampada ON" seja comparada
-// prioritariamente a exemplos de "lampada OFF".
-// Nao depende de internet, API externa ou biblioteca de IA adicional.
-bool ecoPreverDesperdicioKNN(float claridade, bool lampadaLigada) {
-  float menoresDistancias[ECO_K] = {9999.0f, 9999.0f, 9999.0f};
-  bool rotulos[ECO_K] = {false, false, false};
-
-  for (size_t i = 0; i < ECO_TOTAL_EXEMPLOS; i++) {
-    float distancia = fabsf(claridade - ECO_EXEMPLOS[i].claridade);
-    if (lampadaLigada != ECO_EXEMPLOS[i].lampadaLigada) {
-      distancia += 200.0f;
+void ecoLerSerial() {
+  // Os comandos sao opcionais: o carro continua controlado pelo Dabble.
+  while (Serial.available()) {
+    char comando = (char)Serial.read();
+    if (comando == '\n' || comando == '\r' || comando == ' ') continue;
+    switch (comando) {
+      case '?': ecoAjuda(); break;
+      case 's': ecoImprimirEstado(); break;
+      case 'r':
+        ecoReiniciarContagem();
+        Serial.println("[ECO] Contagem reiniciada.");
+        break;
+      case 'e':
+#if !ECO_MODO_SIMULACAO
+        ecoLeitura = analogRead(PINO_LDR);
+        ecoRawEscuro = ecoLeitura;
+        ecoPrefs.putInt("escuro", ecoRawEscuro);
+        ecoReiniciarContagem();
+        Serial.printf("[ECO] Escuro calibrado: %d ADC\n", ecoRawEscuro);
+        break;
+#else
+        Serial.println("[ECO] Simulacao: calibracao e=600 ja definida.");
+        break;
+#endif
+      case 'c':
+#if !ECO_MODO_SIMULACAO
+        ecoLeitura = analogRead(PINO_LDR);
+        ecoRawClaro = ecoLeitura;
+        ecoPrefs.putInt("claro", ecoRawClaro);
+        ecoReiniciarContagem();
+        Serial.printf("[ECO] Claro calibrado: %d ADC\n", ecoRawClaro);
+        if (!ecoCalibrado())
+          Serial.println("[ECO] ATENCAO: valores proximos! Repita e/c em condicoes diferentes.");
+        break;
+#else
+        Serial.println("[ECO] Simulacao: calibracao c=3300 ja definida.");
+        break;
+#endif
+#if ECO_MODO_SIMULACAO
+      case 'a':
+        ecoSimulacaoADC = 3300;
+        Serial.println("[ECO] Ambiente CLARO simulado.");
+        break;
+      case 'b':
+        ecoSimulacaoADC = 600;
+        Serial.println("[ECO] Ambiente ESCURO simulado.");
+        break;
+#endif
+      default: break;
     }
-    for (int pos = 0; pos < ECO_K; pos++) {
-      if (distancia < menoresDistancias[pos]) {
-        for (int j = ECO_K - 1; j > pos; j--) {
-          menoresDistancias[j] = menoresDistancias[j - 1];
-          rotulos[j] = rotulos[j - 1];
+  }
+}
+
+// k-NN de 3 vizinhos sobre exemplos didaticos rotulados.
+// Faz classificacao de situacoes, NAO mede corrente ou energia eletrica.
+int ecoClassificarKNN(int claridadePct, unsigned long tempoMs) {
+  int tempoEscala = (int)min(100UL, tempoMs / 6000UL); // 0..100 para 0..10 min
+  long melhoresDist[3] = { 2147483647L, 2147483647L, 2147483647L };
+  int melhoresClasses[3] = {0, 0, 0};
+  for (int i = 0; i < ECO_N_TREINO; i++) {
+    long dl = claridadePct - (int)ECO_TREINO[i].luz;
+    long dt = tempoEscala - (int)ECO_TREINO[i].tempo;
+    long distancia = dl * dl + dt * dt;
+    for (int j = 0; j < 3; j++) {
+      if (distancia < melhoresDist[j]) {
+        for (int k = 2; k > j; k--) {
+          melhoresDist[k] = melhoresDist[k - 1];
+          melhoresClasses[k] = melhoresClasses[k - 1];
         }
-        menoresDistancias[pos] = distancia;
-        rotulos[pos] = ECO_EXEMPLOS[i].desperdicio;
+        melhoresDist[j] = distancia;
+        melhoresClasses[j] = ECO_TREINO[i].classe;
         break;
       }
     }
   }
-
-  int votosDesperdicio = 0;
-  for (int i = 0; i < ECO_K; i++) {
-    if (rotulos[i]) votosDesperdicio++;
-  }
-  return votosDesperdicio >= 2;
+  int votos[3] = {0,0,0};
+  for (int i=0; i<3; i++) votos[melhoresClasses[i]]++;
+  int vencedora = 0;
+  if (votos[1] > votos[vencedora]) vencedora = 1;
+  if (votos[2] > votos[vencedora]) vencedora = 2;
+  return vencedora;
 }
 
-void ecoProcessarComandos() {
-  while (Serial.available() > 0) {
-    char tecla = (char)Serial.read();
-    if (tecla == 'e' || tecla == 'E') {
-#if ECO_TESTE_SEM_LDR
-      ecoSimularClaro = false;
+const char* ecoNomeClasse(int classe) {
+  if (classe == 2) return "REVISAR USO";
+  if (classe == 1) return "ATENCAO";
+  return "NORMAL";
+}
+
+void ecoMonitorar() {
+  unsigned long agora = millis();
+  if (agora - ecoUltimaLeituraMs < ECO_INTERVALO_LEITURA_MS) return;
+  ecoUltimaLeituraMs = agora;
+#if ECO_MODO_SIMULACAO
+  ecoLeitura = ecoSimulacaoADC;
+#else
+  ecoLeitura = analogRead(PINO_LDR);
 #endif
-      ecoLeituraEscuro = ecoLerLDR();
-      Serial.print("[ECO] Escuro registrado. ADC = ");
-      Serial.println(ecoLeituraEscuro);
-    } else if (tecla == 'c' || tecla == 'C') {
-#if ECO_TESTE_SEM_LDR
-      ecoSimularClaro = true;
-#endif
-      ecoLeituraClaro = ecoLerLDR();
-      Serial.print("[ECO] Claro registrado. ADC = ");
-      Serial.println(ecoLeituraClaro);
-#if ECO_TESTE_SEM_LDR
-    } else if (tecla == 'a' || tecla == 'A') {
-      ecoSimularClaro = true;
-      Serial.println("[ECO TESTE] Ambiente CLARO simulado (3300 ADC)");
-    } else if (tecla == 'b' || tecla == 'B') {
-      ecoSimularClaro = false;
-      Serial.println("[ECO TESTE] Ambiente ESCURO simulado (600 ADC)");
-#endif
-    } else if (tecla == '1') {
-      ecoLampadaInformada = true;
-      ecoLampadaLigada = true;
-      Serial.println("[ECO] Lampada simulada: LIGADA");
-    } else if (tecla == '0') {
-      ecoLampadaInformada = true;
-      ecoLampadaLigada = false;
-      Serial.println("[ECO] Lampada simulada: DESLIGADA");
-    } else if (tecla == '?') {
-      ecoAjuda();
+
+  if (!ecoCalibrado()) {
+    if (agora - ecoUltimoRelatorioMs >= 4000UL) {
+      ecoUltimoRelatorioMs = agora;
+      Serial.printf("[ECO] ADC=%d | Calibre: e=escuro, c=claro\n", ecoLeitura);
     }
-    // Ignora automaticamente \r, \n e outros caracteres.
+    return; // sem calibracao confiavel nao gera alarmes
+  }
+
+  // Funciona mesmo que um modulo LDR tenha curva invertida.
+  long percentual = (long)(ecoLeitura - ecoRawEscuro) * 100L /
+                    (long)(ecoRawClaro - ecoRawEscuro);
+  ecoPercentual = constrain((int)percentual, 0, 100);
+
+  // Histerese para evitar falso disparo perto do limiar.
+  bool candidato = ecoLuzCandidata
+    ? (ecoPercentual >= ECO_LUZ_DESLIGADA_PCT)
+    : (ecoPercentual >= ECO_LUZ_LIGADA_PCT);
+
+  if (candidato != ecoLuzCandidata) {
+    ecoLuzCandidata = candidato;
+    ecoMudancaCandidataMs = agora;
+  }
+
+  // So muda o estado apos 2s estaveis; filtra sombras momentaneas.
+  if (ecoLuzConfirmada != ecoLuzCandidata &&
+      agora - ecoMudancaCandidataMs >= ECO_TEMPO_ESTAVEL_MS) {
+    ecoLuzConfirmada = ecoLuzCandidata;
+    if (ecoLuzConfirmada) {
+      ecoInicioLuzMs = agora;
+      ecoAlertaAtivo = false;
+      Serial.println("[ECO] Claridade detectada: iniciando contagem.");
+    } else {
+      ecoReiniciarContagem();
+      Serial.println("[ECO] Ambiente escureceu: contagem zerada.");
+    }
+  }
+
+  unsigned long tempoLuzMs = ecoLuzConfirmada ? agora - ecoInicioLuzMs : 0UL;
+  ecoClasseIA = ecoLuzConfirmada ? ecoClassificarKNN(ecoPercentual, tempoLuzMs) : 0;
+
+  if (ecoLuzConfirmada && !ecoAlertaAtivo && tempoLuzMs >= ECO_TEMPO_ALERTA_MS) {
+    ecoAlertaAtivo = true;
+    ecoUltimoBipMs = agora - ECO_INTERVALO_BIP_MS; // primeiro bip imediato
+    logMsg("ECO", "ALERTA: iluminacao continua acima do tempo permitido!");
+    Serial.println("[ECO] RECOMENDACAO: verificar se ha lampada ligada desnecessariamente.");
+  }
+
+  if (agora - ecoUltimoRelatorioMs >= 2000UL) {
+    ecoUltimoRelatorioMs = agora;
+    ecoImprimirEstado();
   }
 }
 
-void ecoDesenharResumo() {
-  // Nao interrompe as expressoes faciais enquanto o robo esta se movendo,
-  // dançando, tocando ou em piloto automatico.
-  if (autopilotAtivo || currentFace != FACE_IDLE) return;
-  if (millis() - ultimaAcaoMs < 2000) return;
-  if (millis() - ecoUltimaTelaMs < ECO_INTERVALO_TELA_MS) return;
-  ecoUltimaTelaMs = millis();
+void ecoImprimirEstado() {
+  unsigned long tempo = ecoLuzConfirmada ? (millis() - ecoInicioLuzMs) / 1000UL : 0UL;
+  Serial.printf("[ECO] ADC=%d | Luz=%d%% | Estado=%s | Tempo=%02lu:%02lu | IA=%s | Alerta=%s\n",
+                ecoLeitura, ecoPercentual,
+                ecoCalibrado() ? (ecoLuzConfirmada ? "CLARO" : "ESCURO") : "SEM CALIBRACAO",
+                (unsigned long)(tempo/60UL), (unsigned long)(tempo%60UL),
+                ecoNomeClasse(ecoClasseIA), ecoAlertaAtivo ? "SIM" : "NAO");
+}
 
+// Bip curto a cada 5s apos o tempo limite, SEM delay() nem novo buzzer.
+void ecoAlertaSonoro(bool outroSomAtivo) {
+  unsigned long agora = millis();
+  if (!ecoAlertaAtivo || outroSomAtivo) {
+    if (ecoBipAtivo) { noTone(BUZZER); ecoBipAtivo = false; }
+    return;
+  }
+  if (ecoBipAtivo) {
+    if (agora - ecoInicioBipMs >= ECO_DURACAO_BIP_MS) {
+      noTone(BUZZER);
+      ecoBipAtivo = false;
+    }
+  } else if (agora - ecoUltimoBipMs >= ECO_INTERVALO_BIP_MS) {
+    tone(BUZZER, 1400);
+    ecoBipAtivo = true;
+    ecoInicioBipMs = agora;
+    ecoUltimoBipMs = agora;
+  }
+}
+
+// Mostra status no OLED em janelas curtas para preservar as carinhas.
+void ecoAtualizarOLED() {
+  if (!displayOk) return;
+  unsigned long agora = millis();
+  bool mostrar = ((agora % 10000UL) < (ecoAlertaAtivo ? 5000UL : 2500UL));
+  if (!mostrar) {
+    if (ecoTelaAtiva) {
+      ecoTelaAtiva = false;
+      desenharFace(currentFace);
+      lastDrawnFace = currentFace;
+    }
+    return;
+  }
+  if (ecoTelaAtiva && agora - ecoUltimaTelaMs < 600UL) return;
+  ecoTelaAtiva = true;
+  ecoUltimaTelaMs = agora;
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.println("ECOBOT - ENERGIA");
+  display.println("ECOBOT  |  CITIZENTECH");
   display.drawLine(0, 11, 127, 11, SSD1306_WHITE);
-
-  if (!ecoEstaCalibrado()) {
-    display.setCursor(0, 20);
-    display.println("Calibre o LDR:");
-    display.println("e = escuro");
-    display.println("c = claro");
-  } else if (!ecoLampadaInformada) {
-    display.setCursor(0, 20);
-    display.print("Luz ambiente: ");
-    display.print((int)ecoClaridadePercentual);
-    display.println("%");
-    display.println("Informe lampada:");
-    display.println("1=ON  0=OFF");
+  display.setCursor(0, 17);
+  if (!ecoCalibrado()) {
+    display.println("CALIBRAR SENSOR LDR");
+    display.println("Serial: e e depois c");
+    display.println("115200 baud");
   } else {
-    display.setCursor(0, 18);
-    display.print("Claridade: ");
-    display.print((int)ecoClaridadePercentual);
-    display.println("%");
-    display.print("Lampada: ");
-    display.println(ecoLampadaLigada ? "ON" : "OFF");
-    display.println(ecoAlertaDesperdicio ? "IA: POSSIVEL" : "IA: USO OK");
-    if (ecoAlertaDesperdicio) display.println("DESPERDICIO!");
-    else display.println("Economia consciente");
+    unsigned long tempo = ecoLuzConfirmada ? (agora - ecoInicioLuzMs) / 1000UL : 0UL;
+    display.printf("Luz: %d%%  ADC:%d\n", ecoPercentual, ecoLeitura);
+    display.printf("Tempo: %02lu:%02lu\n", (unsigned long)(tempo / 60UL),
+                   (unsigned long)(tempo % 60UL));
+    display.print("IA: ");
+    display.println(ecoNomeClasse(ecoClasseIA));
+    display.println(ecoAlertaAtivo ? "ALERTA: REVER LUZ" : "Monitorando...");
   }
   display.display();
-}
-
-void ecoIniciar() {
-  pinMode(ECO_PIN_LDR, INPUT);
-  analogReadResolution(12);  // ESP32: leituras analogicas 0..4095.
-#if ECO_TESTE_SEM_LDR
-  Serial.println("[ECO TESTE] Sem LDR fisico: simulacao ATIVA.");
-  Serial.println("[ECO TESTE] Use e, c, 1, 0, a e b para testar a IA.");
-#else
-  Serial.println("[ECO] Sensor LDR no GPIO 34 pronto.");
-#endif
-  Serial.println("[ECO] Comece com e (escuro) e c (claro) no Monitor Serial.");
-  ecoAjuda();
-}
-
-void ecoAtualizar() {
-  ecoProcessarComandos();
-  unsigned long agora = millis();
-  if (agora - ecoUltimaAnaliseMs < ECO_INTERVALO_MS) return;
-  ecoUltimaAnaliseMs = agora;
-
-  ecoLeituraAtual = ecoLerLDR();
-  Serial.print("[ECO] LDR ADC = ");
-  Serial.print(ecoLeituraAtual);
-
-  if (!ecoEstaCalibrado()) {
-    Serial.println(" | Calibracao pendente (use e e c com luzes diferentes)");
-    ecoDesenharResumo();
-    return;
-  }
-
-  ecoClaridadePercentual = ecoConverterParaPercentual(ecoLeituraAtual);
-  Serial.print(" | Claridade = ");
-  Serial.print(ecoClaridadePercentual, 0);
-  Serial.print("%");
-
-  if (!ecoLampadaInformada) {
-    Serial.println(" | Informe 1 (lampada ON) ou 0 (OFF)");
-    ecoDesenharResumo();
-    return;
-  }
-
-  ecoAlertaDesperdicio = ecoPreverDesperdicioKNN(
-    ecoClaridadePercentual, ecoLampadaLigada
-  );
-  Serial.print(" | Lampada = ");
-  Serial.print(ecoLampadaLigada ? "ON" : "OFF");
-  if (ecoAlertaDesperdicio) {
-    Serial.println(" | IA: POSSIVEL DESPERDICIO! Considere apagar a lampada.");
-    // Estimativa ilustrativa: 10 W * 4 h/dia * 30 dias / 1000 = 1,2 kWh/mes.
-    // NAO e uma medicao real de consumo ou economia.
-    Serial.println("[ECO] Exemplo de economia: 10 W por 4 h/dia = 1.2 kWh/mes.");
-  } else {
-    Serial.println(" | IA: NENHUM DESPERDICIO IDENTIFICADO NESTE CENARIO");
-  }
-  ecoDesenharResumo();
 }
