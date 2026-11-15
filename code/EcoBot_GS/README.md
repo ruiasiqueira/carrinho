@@ -10,7 +10,7 @@
  Luan Macea
 **Turma:** 4ESPW 
 **Repositório:** (https://github.com/ruiasiqueira/carrinho)  
-**Vídeo demonstrativo (máximo de 6 minutos):** link do video 
+**Vídeo demonstrativo (máximo de 6 minutos):** https://youtu.be/KTf69Ze1XEM?si=1_dIUUs6-AuNHhLE
 
 
 ## 1. Resumo executivo
