@@ -8,6 +8,7 @@
 **Controle:** Bluetooth via aplicativo Dabble
 
 Implementação de IA + LDR na pasta “EcoBot_GS” (explicação completa + demonstração).
+
 Vídeo demonstrativo GS:Vídeo demonstrativo (máximo de 6 minutos): https://youtu.be/KTf69Ze1XEM?si=1_dIUUs6-AuNHhLE
 
 Este projeto consiste na construção de um carrinho robótico com quatro motores DC e quatro rodas, controlado por um ESP32. O sistema utiliza Bluetooth para controle remoto através do aplicativo Dabble, uma Ponte H L298N para acionamento dos motores, um sensor ultrassônico HC-SR04 para detecção de obstáculos e um buzzer para alertas.
