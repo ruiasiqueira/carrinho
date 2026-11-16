@@ -42,7 +42,6 @@ O projeto se relaciona com **CitizenTech** ao explorar tecnologia acessível par
 | Encerramento automático | Uma leitura `ADC <= 100` zera o contador e encerra o alerta |
 | Reconhecimento | `SELECT` no GamePad, ou `k` no Monitor Serial/Terminal Dabble |
 | Aviso no celular | Pedido de notificação via `Notification.notifyPhone(...)` quando Dabble está conectado; mensagem também enviada ao Terminal |
-| OLED | ADC, limiar, duração, classe IA e estado do alarme; preserva as expressões do carrinho |
 | IA | k-NN com 3 vizinhos mais próximos e 18 amostras sintéticas |
 | Robótica original | Controle Bluetooth/GamePad, motores e desvio de obstáculos por ultrassom |
 
